@@ -319,60 +319,115 @@ class FitRecSpeedPredictor:
 
         return model
 
-    def train(self, data, test_size=0.2, validation_size=0.1, epochs=100, batch_size=32):
+    def split_data(self, data, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
         """
-        Train the speed prediction model
-
+        Split data into train, validation, and test sets chronologically
+        
         Args:
-            data (pd.DataFrame): Training data with timestamp, speed, heart_rate columns
-            test_size (float): Proportion of data for testing
-            validation_size (float): Proportion of training data for validation
-            epochs (int): Number of training epochs
-            batch_size (int): Batch size for training
+            data (pd.DataFrame): Input data with timestamp, speed, heart_rate columns
+            train_ratio (float): Proportion for training data
+            val_ratio (float): Proportion for validation data  
+            test_ratio (float): Proportion for test data
+        
+        Returns:
+            tuple: (train_data, val_data, test_data, split_info)
         """
-        print("Creating time-based sequences...")
+        if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+            raise ValueError("Train, validation, and test ratios must sum to 1.0")
+        
+        print("Creating time-based sequences for data splitting...")
         X, y, timestamps_x, timestamps_y = self.create_time_based_sequences(data)
-
+        
         if len(X) == 0:
-            print("No sequences created. Cannot train the model.")
-            return None, None
-
-        # Split data chronologically (important for time series)
-        train_size = int(len(X) * (1 - test_size))
-        val_size = int(train_size * validation_size)
-
-        X_train = X[:train_size - val_size]
-        y_train = y[:train_size - val_size]
-
-        X_val = X[train_size - val_size:train_size]
-        y_val = y[train_size - val_size:train_size]
-
-        X_test = X[train_size:]
-        y_test = y[train_size:]
-        timestamps_test = timestamps_y[train_size:]
-
+            print("No sequences created. Cannot split data.")
+            return None, None, None, None
+        
+        # Calculate split indices chronologically
+        n_total = len(X)
+        train_end = int(n_total * train_ratio)
+        val_end = int(n_total * (train_ratio + val_ratio))
+        
+        # Split the data chronologically
+        X_train = X[:train_end]
+        y_train = y[:train_end]
+        timestamps_train = timestamps_y[:train_end]
+        
+        X_val = X[train_end:val_end]
+        y_val = y[train_end:val_end]
+        timestamps_val = timestamps_y[train_end:val_end]
+        
+        X_test = X[val_end:]
+        y_test = y[val_end:]
+        timestamps_test = timestamps_y[val_end:]
+        
+        # Store split data for later use
+        self.split_data_cache = {
+            'X_train': X_train, 'y_train': y_train, 'timestamps_train': timestamps_train,
+            'X_val': X_val, 'y_val': y_val, 'timestamps_val': timestamps_val,
+            'X_test': X_test, 'y_test': y_test, 'timestamps_test': timestamps_test
+        }
+        
+        split_info = {
+            'total_sequences': n_total,
+            'train_sequences': len(X_train),
+            'val_sequences': len(X_val), 
+            'test_sequences': len(X_test),
+            'train_ratio': len(X_train) / n_total,
+            'val_ratio': len(X_val) / n_total,
+            'test_ratio': len(X_test) / n_total
+        }
+        
+        print(f"\nData Split Summary:")
+        print(f"Total sequences: {split_info['total_sequences']}")
+        print(f"Training: {split_info['train_sequences']} sequences ({split_info['train_ratio']:.1%})")
+        print(f"Validation: {split_info['val_sequences']} sequences ({split_info['val_ratio']:.1%})")
+        print(f"Test: {split_info['test_sequences']} sequences ({split_info['test_ratio']:.1%})")
         print(f"Training set shape: {X_train.shape}")
         print(f"Validation set shape: {X_val.shape}")
         print(f"Test set shape: {X_test.shape}")
+        
+        return (X_train, y_train, timestamps_train), (X_val, y_val, timestamps_val), (X_test, y_test, timestamps_test), split_info
 
+    def train_model_only(self, train_data, val_data, epochs=100, batch_size=32, verbose=1):
+        """
+        Train the model using only train and validation data (no test evaluation)
+        
+        Args:
+            train_data (tuple): (X_train, y_train, timestamps_train)
+            val_data (tuple): (X_val, y_val, timestamps_val)
+            epochs (int): Number of training epochs
+            batch_size (int): Batch size for training
+            verbose (int): Verbosity level for training
+            
+        Returns:
+            keras.callbacks.History: Training history
+        """
+        X_train, y_train, _ = train_data
+        X_val, y_val, _ = val_data
+        
+        if len(X_train) == 0:
+            print("No training data available.")
+            return None
+            
         # Create and compile model
         self.model = self.create_model(input_shape=(X_train.shape[1], X_train.shape[2]))
-        print(self.model.summary())
-
+        if verbose > 0:
+            print(self.model.summary())
+        
         # Callbacks
         early_stopping = EarlyStopping(
             monitor='val_loss',
-            patience=20, # Increased patience slightly to allow more time for regularization to kick in
+            patience=20,
             restore_best_weights=True
         )
-
+        
         reduce_lr = ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.3, # More aggressive learning rate reduction
-            patience=10, # Increased patience for LR reduction
-            min_lr=1e-7 # Slightly lower min_lr
+            factor=0.3,
+            patience=10,
+            min_lr=1e-7
         )
-
+        
         # Train model
         print("Training model...")
         history = self.model.fit(
@@ -381,59 +436,157 @@ class FitRecSpeedPredictor:
             epochs=epochs,
             batch_size=batch_size,
             callbacks=[early_stopping, reduce_lr],
-            verbose=1
+            verbose=verbose
         )
+        
+        return history
 
-        # Evaluate on test set
-        print("\nEvaluating on test set...")
-        if len(X_test) > 0:
-            test_loss, test_mae = self.model.evaluate(X_test, y_test, verbose=0)
-
-            # Make predictions for detailed evaluation
-            y_pred = self.model.predict(X_test)
-
-            # Inverse transform for interpretable metrics
-            y_test_orig = self.target_scaler.inverse_transform(y_test.reshape(-1, 1)).ravel()
-            y_pred_orig = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).ravel()
-
-            # Calculate metrics
-            mse = mean_squared_error(y_test_orig, y_pred_orig)
-            mae = mean_absolute_error(y_test_orig, y_pred_orig)
-            rmse = np.sqrt(mse)
-
-            print(f"\nTest Results:")
-            print(f"MSE: {mse:.4f}")
-            print(f"MAE: {mae:.4f}")
-            print(f"RMSE: {rmse:.4f}")
-            print(f"Mean actual speed: {y_test_orig.mean():.2f}")
-            print(f"Mean predicted speed: {y_pred_orig.mean():.2f}")
-
-            # Plot training history
-            self.plot_training_history(history)
-
-            # Plot predictions
+    def evaluate_model(self, test_data, plot_results=True):
+        """
+        Evaluate the trained model on test data
+        
+        Args:
+            test_data (tuple): (X_test, y_test, timestamps_test)
+            plot_results (bool): Whether to plot evaluation results
+            
+        Returns:
+            dict: Evaluation results including metrics and predictions
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet! Call train_model_only() first.")
+            
+        X_test, y_test, timestamps_test = test_data
+        
+        if len(X_test) == 0:
+            print("No test data available for evaluation.")
+            return {
+                'mse': np.nan, 'mae': np.nan, 'rmse': np.nan,
+                'y_test': np.array([]), 'y_pred': np.array([]),
+                'timestamps': np.array([])
+            }
+        
+        print("\nEvaluating model on test set...")
+        
+        # Evaluate model
+        test_loss, test_mae = self.model.evaluate(X_test, y_test, verbose=0)
+        
+        # Make predictions
+        y_pred = self.model.predict(X_test, verbose=0)
+        
+        # Inverse transform for interpretable metrics
+        y_test_orig = self.target_scaler.inverse_transform(y_test.reshape(-1, 1)).ravel()
+        y_pred_orig = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).ravel()
+        
+        # Calculate metrics
+        mse = mean_squared_error(y_test_orig, y_pred_orig)
+        mae = mean_absolute_error(y_test_orig, y_pred_orig)
+        rmse = np.sqrt(mse)
+        
+        # Calculate additional metrics
+        mape = np.mean(np.abs((y_test_orig - y_pred_orig) / np.maximum(y_test_orig, 1e-8))) * 100
+        r2 = 1 - (np.sum((y_test_orig - y_pred_orig) ** 2) / np.sum((y_test_orig - np.mean(y_test_orig)) ** 2))
+        
+        results = {
+            'test_loss': test_loss,
+            'test_mae_scaled': test_mae,
+            'mse': mse,
+            'mae': mae,
+            'rmse': rmse,
+            'mape': mape,
+            'r2_score': r2,
+            'y_test': y_test_orig,
+            'y_pred': y_pred_orig,
+            'timestamps': timestamps_test,
+            'mean_actual': y_test_orig.mean(),
+            'mean_predicted': y_pred_orig.mean(),
+            'std_actual': y_test_orig.std(),
+            'std_predicted': y_pred_orig.std()
+        }
+        
+        print(f"\nTest Results:")
+        print(f"MSE: {mse:.4f}")
+        print(f"MAE: {mae:.4f}")
+        print(f"RMSE: {rmse:.4f}")
+        print(f"MAPE: {mape:.2f}%")
+        print(f"R² Score: {r2:.4f}")
+        print(f"Mean actual speed: {y_test_orig.mean():.2f} ± {y_test_orig.std():.2f}")
+        print(f"Mean predicted speed: {y_pred_orig.mean():.2f} ± {y_pred_orig.std():.2f}")
+        
+        if plot_results:
             self.plot_predictions(y_test_orig, y_pred_orig)
+            
+        return results
 
-            return history, {
-                'X_test': X_test,
-                'y_test': y_test_orig,
-                'y_pred': y_pred_orig,
-                'timestamps': timestamps_test,
-                'mse': mse,
-                'mae': mae,
-                'rmse': rmse
-            }
-        else:
-            print("Test set is empty. Skipping evaluation.")
-            return history, {
-                'X_test': X_test,
-                'y_test': np.array([]),
-                'y_pred': np.array([]),
-                'timestamps': np.array([]),
-                'mse': np.nan,
-                'mae': np.nan,
-                'rmse': np.nan
-            }
+    def save_test_data(self, test_data, filepath="test_data.npz"):
+        """
+        Save test data to file for later evaluation
+        
+        Args:
+            test_data (tuple): (X_test, y_test, timestamps_test)
+            filepath (str): Path to save the test data
+        """
+        X_test, y_test, timestamps_test = test_data
+        
+        np.savez(filepath, 
+                 X_test=X_test, 
+                 y_test=y_test, 
+                 timestamps_test=timestamps_test)
+        print(f"Test data saved to {filepath}")
+
+    def load_test_data(self, filepath="test_data.npz"):
+        """
+        Load test data from file
+        
+        Args:
+            filepath (str): Path to load the test data from
+            
+        Returns:
+            tuple: (X_test, y_test, timestamps_test)
+        """
+        data = np.load(filepath)
+        X_test = data['X_test']
+        y_test = data['y_test'] 
+        timestamps_test = data['timestamps_test']
+        print(f"Test data loaded from {filepath}")
+        return X_test, y_test, timestamps_test
+
+    def train(self, data, test_size=0.2, validation_size=0.1, epochs=100, batch_size=32):
+        """
+        Train the speed prediction model (legacy method - updated to use new splitting approach)
+
+        Args:
+            data (pd.DataFrame): Training data with timestamp, speed, heart_rate columns
+            test_size (float): Proportion of data for testing
+            validation_size (float): Proportion of training data for validation
+            epochs (int): Number of training epochs
+            batch_size (int): Batch size for training
+        """
+        # Calculate ratios for new splitting method
+        train_ratio = 1 - test_size
+        val_ratio = train_ratio * validation_size
+        train_ratio = train_ratio * (1 - validation_size)
+        
+        # Use new splitting method
+        train_data, val_data, test_data, split_info = self.split_data(
+            data, train_ratio=train_ratio, val_ratio=val_ratio, test_ratio=test_size
+        )
+        
+        if train_data is None:
+            return None, None
+            
+        # Train model
+        history = self.train_model_only(train_data, val_data, epochs, batch_size)
+        
+        if history is None:
+            return None, None
+            
+        # Evaluate on test set
+        results = self.evaluate_model(test_data, plot_results=True)
+        
+        # Plot training history
+        self.plot_training_history(history)
+        
+        return history, results
 
     def predict(self, input_sequence):
         """
@@ -602,6 +755,79 @@ def main():
         print(f"Not enough data to make a sample prediction. Need at least {window_samples} samples.")
 
     return predictor, results
+
+def demonstrate_data_splitting():
+    """
+    Comprehensive example of data splitting and separate train/test workflow
+    """
+    print("=== Demonstrating Data Splitting and Evaluation Workflow ===\n")
+    
+    # Initialize predictor
+    predictor = FitRecSpeedPredictor(window_duration=30, prediction_duration=30)
+    
+    # Load data
+    print("1. Loading data...")
+    data = predictor.load_endomondo_data()
+    
+    if data is None or data.empty:
+        print("No data loaded. Exiting.")
+        return None, None, None, None
+    
+    print(f"Loaded data shape: {data.shape}")
+    
+    # Split data into train/val/test
+    print("\n2. Splitting data chronologically...")
+    train_data, val_data, test_data, split_info = predictor.split_data(
+        data, 
+        train_ratio=0.7,   # 70% for training
+        val_ratio=0.15,    # 15% for validation  
+        test_ratio=0.15    # 15% for testing
+    )
+    
+    if train_data is None:
+        print("Data splitting failed. Exiting.")
+        return None, None, None, None
+    
+    # Save test data for later evaluation
+    print("\n3. Saving test data for later evaluation...")
+    predictor.save_test_data(test_data, "heart_rate_test_data.npz")
+    
+    # Train model (without test evaluation)
+    print("\n4. Training model...")
+    history = predictor.train_model_only(
+        train_data, 
+        val_data, 
+        epochs=50,  # Reduced for demonstration
+        batch_size=32,
+        verbose=1
+    )
+    
+    if history is None:
+        print("Training failed. Exiting.")
+        return None, None, None, None
+    
+    # Plot training history
+    print("\n5. Plotting training history...")
+    predictor.plot_training_history(history)
+    
+    # Now evaluate on test set
+    print("\n6. Evaluating trained model on test set...")
+    test_results = predictor.evaluate_model(test_data, plot_results=True)
+    
+    # Demonstrate loading test data from file and re-evaluating
+    print("\n7. Demonstrating loading test data from file...")
+    loaded_test_data = predictor.load_test_data("heart_rate_test_data.npz")
+    
+    print("\n8. Re-evaluating with loaded test data...")
+    test_results_reloaded = predictor.evaluate_model(loaded_test_data, plot_results=False)
+    
+    # Compare results
+    print("\n9. Comparing evaluation results:")
+    print(f"Original test MSE: {test_results['mse']:.4f}")
+    print(f"Reloaded test MSE: {test_results_reloaded['mse']:.4f}")
+    print(f"Results match: {np.isclose(test_results['mse'], test_results_reloaded['mse'])}")
+    
+    return predictor, history, test_results, split_info
 
 def load_and_train_endomondo():
     """
